@@ -139,6 +139,8 @@ enum Error {
 
     #[snafu(display("Configuration key: '{}' is not known.", key))]
     UnknownConfigurationKey { key: String },
+
+
 }
 
 impl From<Error> for super::Error {
@@ -721,6 +723,21 @@ impl AmazonS3Builder {
                     self.region = Some(region.to_string());
                     self.virtual_hosted_style_request = true;
                 }
+                Some((_account, "r2", "cloudflarestorage", "com")) => {
+                    self.region = Some("auto".to_string());
+                    self.endpoint = Some(parsed.scheme().to_string() + "://" + host);
+                    if let Some(mut segments) = parsed.path_segments() {
+                        self.bucket_name = Some(
+                            segments
+                                .nth(0)
+                                .and_then(|bucket| match bucket {
+                                    "" => None,
+                                    _ => Some(bucket.to_string()),
+                                })
+                                .context(MissingBucketNameSnafu)?
+                        );
+                    }
+                }
                 _ => return Err(UrlNotRecognisedSnafu { url }.build().into()),
             },
             scheme => return Err(UnknownUrlSchemeSnafu { scheme }.build().into()),
@@ -870,23 +887,23 @@ impl AmazonS3Builder {
         }
 
         let bucket = self.bucket_name.context(MissingBucketNameSnafu)?;
-        let region = self.region.context(MissingRegionSnafu)?;
 
-        let credentials = match (self.access_key_id, self.secret_access_key, self.token) {
-            (Some(key_id), Some(secret_key), token) => {
+        let (credentials, maybe_region) = match (self.access_key_id, self.secret_access_key, self.token, self.region) {
+            (Some(key_id), Some(secret_key), token, region) => {
                 info!("Using Static credential provider");
-                Box::new(StaticCredentialProvider {
+                (Box::new(StaticCredentialProvider {
                     credential: Arc::new(AwsCredential {
                         key_id,
                         secret_key,
                         token,
                     }),
-                }) as _
+                }) as _, region)
             }
-            (None, Some(_), _) => return Err(Error::MissingAccessKeyId.into()),
-            (Some(_), None, _) => return Err(Error::MissingSecretAccessKey.into()),
+            (None, Some(_), _, _) => return Err(Error::MissingAccessKeyId.into()),
+            (Some(_), None, _, _) => return Err(Error::MissingSecretAccessKey.into()),
+            (None, None, _, None) => return Err(Error::MissingRegion.into()),
             // TODO: Replace with `AmazonS3Builder::credentials_from_env`
-            _ => match (
+            (_, _, _, Some(region)) => match (
                 std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE"),
                 std::env::var("AWS_ROLE_ARN"),
             ) {
@@ -905,7 +922,7 @@ impl AmazonS3Builder {
                         .with_allow_http(false)
                         .client()?;
 
-                    Box::new(WebIdentityProvider {
+                    (Box::new(WebIdentityProvider {
                         cache: Default::default(),
                         token_path,
                         session_name,
@@ -913,12 +930,13 @@ impl AmazonS3Builder {
                         endpoint,
                         client,
                         retry_config: self.retry_config.clone(),
-                    }) as _
+                    }) as _, Some(region))
                 }
                 _ => match self.profile {
                     Some(profile) => {
+                        let cloned_region = region.clone();
                         info!("Using profile \"{}\" credential provider", profile);
-                        profile_credentials(profile, region.clone())?
+                        (profile_credentials(profile, region)?, Some(cloned_region))
                     }
                     None => {
                         info!("Using Instance credential provider");
@@ -927,7 +945,7 @@ impl AmazonS3Builder {
                         let client_options =
                             self.client_options.clone().with_allow_http(true);
 
-                        Box::new(InstanceCredentialProvider {
+                        (Box::new(InstanceCredentialProvider {
                             cache: Default::default(),
                             client: client_options.client()?,
                             retry_config: self.retry_config.clone(),
@@ -935,7 +953,7 @@ impl AmazonS3Builder {
                             metadata_endpoint: self
                                 .metadata_endpoint
                                 .unwrap_or_else(|| METADATA_ENDPOINT.into()),
-                        }) as _
+                        }) as _, Some(region))
                     }
                 },
             },
@@ -943,6 +961,11 @@ impl AmazonS3Builder {
 
         let endpoint: String;
         let bucket_endpoint: String;
+
+        // If the endpoint is set, region is not required, otherwise return an error if region is missing.
+        let region = maybe_region
+            .or(self.endpoint.clone().and(Some(String::from(""))))
+            .context(MissingRegionSnafu)?;
 
         // If `endpoint` is provided then its assumed to be consistent with
         // `virtual_hosted_style_request`. i.e. if `virtual_hosted_style_request` is true then
@@ -1342,6 +1365,34 @@ mod tests {
         let mut builder = AmazonS3Builder::new();
         for case in err_cases {
             builder.parse_url(case).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn r2_test_urls() {
+        let mut builder = AmazonS3Builder::new();
+        builder.parse_url("https://account_id.r2.cloudflarestorage.com/bucket").unwrap();
+        assert_eq!(builder.bucket_name, Some("bucket".to_string()));
+        assert_eq!(builder.endpoint, Some("https://account_id.r2.cloudflarestorage.com".to_string()));
+
+        let s3 = builder
+            .with_access_key_id("test")
+            .with_secret_access_key("secret")
+            .build()
+            .unwrap();
+        assert_eq!(s3.client.config().bucket_endpoint, "https://account_id.r2.cloudflarestorage.com/bucket".to_string());
+
+        let err_cases = [
+            // Missing bucket.
+            "https://account_id.r2.cloudflarestorage.com",
+            // Invalid subdomain.
+            "https://account.id.r2.cloudflarestorage.com",
+        ];
+
+        let mut builder = AmazonS3Builder::new();
+        for case in err_cases {
+            let result = builder.parse_url(case);
+            result.unwrap_err();
         }
     }
 }
